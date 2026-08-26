@@ -1,6 +1,8 @@
+-- ---@diagnostic disable: undefined-field
 -- kvcomplete.lua
--- Neovim 0.12+ unified key=value command completion.
--- Declare a spec per command; complete / parse / validate share one compiled form.
+-- Neovim 0.12+ unified command completion.
+-- Base form: key=value (order-independent).
+-- Optional subs: first bare token selects a leaf spec; remaining tokens stay key=value.
 
 local M           = {}
 
@@ -32,6 +34,7 @@ local MAX         = 50
 ---@field raw string               -- whole ArgLead token
 ---@field kv table<string, string|string[]|boolean>
 ---@field used table<string, boolean>
+---@field sub string|nil           -- selected subcommand, if any
 
 ---@class KvKeySpec
 ---@field kind KvKind|nil
@@ -52,8 +55,13 @@ local MAX         = 50
 ---@field pri integer
 ---@field hint string[]|nil
 
+---@class KvSubSpec
+---@field keys table<string, KvKeySpec|string|string[]|boolean|KvKind>|nil
+---@field pri integer|nil
+
 ---@class KvSpec
----@field keys table<string, KvKeySpec|string|string[]|boolean|KvKind>
+---@field keys table<string, KvKeySpec|string|string[]|boolean|KvKind>|nil
+---@field subs table<string, KvSubSpec|table>|nil
 ---@field strict boolean|nil       -- reject unknown keys at run time (default true)
 ---@field max integer|nil          -- complete cap (default 50)
 ---@field desc string|nil
@@ -67,9 +75,14 @@ local MAX         = 50
 ---@field by_name table<string, KvCompiledKey>
 ---@field strict boolean
 ---@field max integer
+---@field has_subs boolean
+---@field subs table<string, KvCompiled>|nil
+---@field sub_names string[]|nil
+---@field pri integer|nil          -- only on sub leaves, for name sort
 
 ---@class KvParsed
 ---@field kv table<string, string|string[]|boolean>
+---@field sub string|nil
 ---@field unknown string[]
 ---@field missing string[]
 ---@field errors string[]
@@ -113,9 +126,8 @@ local function compile_key(name, raw)
   if raw == true then
     k.kind = "string"
   elseif t == "string" then
-    k.kind = raw -- kind shorthand: file / bool / buffer / ...
+    k.kind = raw
   elseif t == "table" and raw[1] ~= nil and raw.kind == nil and raw.values == nil then
-    -- { 'en', 'zh' } → enum
     k.kind = "enum"
     k.values = raw
   elseif t == "table" then
@@ -137,30 +149,96 @@ local function compile_key(name, raw)
   return k
 end
 
----Compile a user spec once. Call at command-definition time, not in complete().
----@param spec KvSpec
+---Compile a flat keys table into list + by_name.
+---@param keys table<string, KvKeySpec|string|string[]|boolean|KvKind>|nil
+---@param strict boolean
+---@param max integer
 ---@return KvCompiled
-function M.compile(spec)
-  assert(type(spec) == "table" and type(spec.keys) == "table", "kvcomplete: spec.keys required")
+local function compile_keys(keys, strict, max)
   ---@type KvCompiledKey[]
   local list = {}
   ---@type table<string, KvCompiledKey>
   local by_name = {}
-  for name, raw in pairs(spec.keys) do
-    local k = compile_key(name, raw)
-    list[#list + 1] = k
-    by_name[name] = k
+  if keys then
+    for name, raw in pairs(keys) do
+      local k = compile_key(name, raw)
+      list[#list + 1] = k
+      by_name[name] = k
+    end
+    table.sort(list, function(a, b)
+      if a.pri ~= b.pri then return a.pri > b.pri end
+      return a.name < b.name
+    end)
   end
-  table.sort(list, function(a, b)
-    if a.pri ~= b.pri then return a.pri > b.pri end
-    return a.name < b.name
-  end)
   return {
     list = list,
     by_name = by_name,
-    strict = spec.strict ~= false,
-    max = spec.max or MAX,
+    strict = strict,
+    max = max,
+    has_subs = false,
   }
+end
+
+---@param raw KvSubSpec|table
+---@return table keys, integer pri
+local function sub_keys_and_pri(raw)
+  if type(raw) ~= "table" then
+    return {}, 0
+  end
+  if raw.keys ~= nil then
+    return raw.keys, raw.pri or 0
+  end
+  return raw, 0
+end
+
+---Compile a user spec once. Call at command-definition time, not in complete().
+---No `subs` → identical to the original flat key=value spec.
+---@param spec KvSpec
+---@return KvCompiled
+function M.compile(spec)
+  assert(type(spec) == "table", "kvcomplete: spec table required")
+  assert(spec.keys ~= nil or spec.subs ~= nil, "kvcomplete: spec.keys or spec.subs required")
+
+  local strict = spec.strict ~= false
+  local max = spec.max or MAX
+  local root_keys = spec.keys or {}
+  local root = compile_keys(root_keys, strict, max)
+
+  if not spec.subs then
+    return root
+  end
+
+  ---@type table<string, KvCompiled>
+  local subs = {}
+  ---@type string[]
+  local names = {}
+  for name, raw in pairs(spec.subs) do
+    local extra, pri = sub_keys_and_pri(raw)
+    ---@type table<string, KvKeySpec|string|string[]|boolean|KvKind>
+    local merged = {}
+    for k, v in pairs(root_keys) do
+      merged[k] = v
+    end
+    if type(extra) == "table" then
+      for k, v in pairs(extra) do
+        merged[k] = v
+      end
+    end
+    local leaf = compile_keys(merged, strict, max)
+    leaf.pri = pri
+    subs[name] = leaf
+    names[#names + 1] = name
+  end
+  table.sort(names, function(a, b)
+    local pa, pb = subs[a].pri or 0, subs[b].pri or 0
+    if pa ~= pb then return pa > pb end
+    return a < b
+  end)
+
+  root.has_subs = true
+  root.subs = subs
+  root.sub_names = names
+  return root
 end
 
 ----------------------------------------------------------------------
@@ -179,7 +257,7 @@ end
 local function tokenize(s, i, stop)
   ---@type KvToken[]
   local out, acc = {}, {}
-  local q = nil -- current quote char
+  local q = nil
   local function flush(done)
     if #acc == 0 then return end
     out[#out + 1] = { text = table.concat(acc), done = done }
@@ -206,6 +284,15 @@ local function tokenize(s, i, stop)
   return out
 end
 
+---@param cmd_line string
+---@param cursor_pos integer
+---@return KvToken[]
+local function args_tokens(cmd_line, cursor_pos)
+  local stop = math.min(cursor_pos, #cmd_line)
+  local sp = cmd_line:find("%s") or (stop + 1)
+  return tokenize(cmd_line, sp + 1, stop)
+end
+
 ---Strip one layer of matching quotes.
 ---@param s string
 ---@return string
@@ -226,26 +313,25 @@ local function split_kv(tok)
   return tok:sub(1, eq - 1), tok:sub(eq + 1)
 end
 
----Parse a full args string (not fargs) into kv map.
----@param compiled KvCompiled
----@param args string
+---@param leaf KvCompiled
+---@param tokens KvToken[]
+---@param start integer
 ---@return KvParsed
-function M.parse(compiled, args)
+local function parse_tokens(leaf, tokens, start)
   ---@type table<string, string|string[]|boolean>
   local kv = {}
   ---@type string[]
   local unknown, errors = {}, {}
-  args = args or ""
-  local tokens = tokenize(args, 1, #args)
-  for i = 1, #tokens do
+
+  for i = start, #tokens do
     local key, val = split_kv(tokens[i].text)
     if key == "" then
       errors[#errors + 1] = "empty key in '" .. tokens[i].text .. "'"
     else
-      local spec = compiled.by_name[key]
+      local spec = leaf.by_name[key]
       if not spec then
         unknown[#unknown + 1] = key
-        if compiled.strict then
+        if leaf.strict then
           errors[#errors + 1] = "unknown key: " .. key
         end
       elseif val == nil then
@@ -271,16 +357,63 @@ function M.parse(compiled, args)
       end
     end
   end
+
   ---@type string[]
   local missing = {}
-  for i = 1, #compiled.list do
-    local k = compiled.list[i]
+  for i = 1, #leaf.list do
+    local k = leaf.list[i]
     if k.required and kv[k.name] == nil then
       missing[#missing + 1] = k.name
       errors[#errors + 1] = "missing required key: " .. k.name
     end
   end
   return { kv = kv, unknown = unknown, missing = missing, errors = errors }
+end
+
+---Parse a full args string (not fargs) into kv map.
+---If compiled.has_subs and the first token has no '=', that token is the sub.
+---@param compiled KvCompiled
+---@param args string
+---@return KvParsed
+function M.parse(compiled, args)
+  args = args or ""
+  local tokens = tokenize(args, 1, #args)
+
+  local leaf = compiled
+  local sub = nil
+  local start = 1
+
+  if compiled.has_subs and tokens[1] then
+    local name, val = split_kv(tokens[1].text)
+    if val == nil then
+      local found = compiled.subs and compiled.subs[name]
+      if found then
+        sub = name
+        leaf = found
+        start = 2
+      else
+        return {
+          kv = {},
+          sub = nil,
+          unknown = { name },
+          missing = {},
+          errors = { "unknown subcommand: " .. name },
+        }
+      end
+    elseif #compiled.list == 0 then
+      return {
+        kv = {},
+        sub = nil,
+        unknown = {},
+        missing = {},
+        errors = { "missing subcommand" },
+      }
+    end
+  end
+
+  local parsed = parse_tokens(leaf, tokens, start)
+  parsed.sub = sub
+  return parsed
 end
 
 ----------------------------------------------------------------------
@@ -321,21 +454,17 @@ local function values_of(spec, ctx)
   return spec.hint or {}
 end
 
----Build already-finished keys from cmdline left of cursor.
----@param cmd_line string
----@param cursor_pos integer
+---Collect finished key=value tokens starting at `start`.
+---@param tokens KvToken[]
+---@param start integer
 ---@return table<string, boolean> used
----@return table<string, string> kv_so_far
-local function context_left(cmd_line, cursor_pos)
-  local stop = math.min(cursor_pos, #cmd_line)
-  -- skip command name
-  local sp = cmd_line:find("%s") or (stop + 1)
-  local tokens = tokenize(cmd_line, sp + 1, stop)
+---@return table<string, string> kv
+local function keys_from_tokens(tokens, start)
   ---@type table<string, boolean>
   local used = {}
   ---@type table<string, string>
   local kv = {}
-  for i = 1, #tokens do
+  for i = start, #tokens do
     local tok = tokens[i]
     if tok.done then
       local key, val = split_kv(tok.text)
@@ -348,23 +477,22 @@ local function context_left(cmd_line, cursor_pos)
   return used, kv
 end
 
----customlist complete. Return order = Tab order.
----@param compiled KvCompiled
+---Complete against one compiled leaf (root or sub).
+---@param leaf KvCompiled
 ---@param arg_lead string
----@param cmd_line string
----@param cursor_pos integer
+---@param used table<string, boolean>
+---@param kv_so_far table<string, string>
+---@param sub string|nil
 ---@return string[]
-function M.complete(compiled, arg_lead, cmd_line, cursor_pos)
-  local cap = compiled.max
-  local used, kv_so_far = context_left(cmd_line, cursor_pos)
+local function complete_kv(leaf, arg_lead, used, kv_so_far, sub)
+  local cap = leaf.max
   local key, val = split_kv(arg_lead)
 
-  -- no '=' yet → suggest key=
   if val == nil then
     ---@type string[]
     local names = {}
-    for i = 1, #compiled.list do
-      local k = compiled.list[i]
+    for i = 1, #leaf.list do
+      local k = leaf.list[i]
       if not (k.unique and used[k.name]) then
         names[#names + 1] = k.name
       end
@@ -376,7 +504,7 @@ function M.complete(compiled, arg_lead, cmd_line, cursor_pos)
     return hit
   end
 
-  local spec = compiled.by_name[key]
+  local spec = leaf.by_name[key]
   if not spec then return {} end
 
   ---@type KvCtx
@@ -386,6 +514,7 @@ function M.complete(compiled, arg_lead, cmd_line, cursor_pos)
     raw = arg_lead,
     kv = kv_so_far,
     used = used,
+    sub = sub,
   }
   local vals = values_of(spec, ctx)
   local hit = fuzzy_take(vals, ctx.lead, cap)
@@ -400,12 +529,55 @@ function M.complete(compiled, arg_lead, cmd_line, cursor_pos)
   return hit
 end
 
+---customlist complete. Return order = Tab order.
+---With subs: first unfinished bare token completes sub names (no '=').
+---@param compiled KvCompiled
+---@param arg_lead string
+---@param cmd_line string
+---@param cursor_pos integer
+---@return string[]
+function M.complete(compiled, arg_lead, cmd_line, cursor_pos)
+  local tokens = args_tokens(cmd_line, cursor_pos)
+
+  if compiled.has_subs then
+    local first_done = nil
+    for i = 1, #tokens do
+      if tokens[i].done then
+        first_done = tokens[i]
+        break
+      end
+    end
+
+    if not first_done then
+      local _, val = split_kv(arg_lead)
+      if val == nil then
+        return fuzzy_take(compiled.sub_names or {}, arg_lead, compiled.max)
+      end
+      return complete_kv(compiled, arg_lead, {}, {}, nil)
+    end
+
+    local name, val = split_kv(first_done.text)
+    if val == nil then
+      local leaf = compiled.subs and compiled.subs[name]
+      if leaf then
+        local used, kv = keys_from_tokens(tokens, 2)
+        return complete_kv(leaf, arg_lead, used, kv, name)
+      end
+      return fuzzy_take(compiled.sub_names or {}, arg_lead, compiled.max)
+    end
+  end
+
+  local used, kv = keys_from_tokens(tokens, 1)
+  return complete_kv(compiled, arg_lead, used, kv, nil)
+end
+
 ----------------------------------------------------------------------
 -- Command factory
 ----------------------------------------------------------------------
 
 ---@class KvCommandOpts
 ---@field kv table<string, string|string[]|boolean>
+---@field sub string|nil
 ---@field parsed KvParsed
 ---@field args string
 ---@field fargs string[]
@@ -418,7 +590,7 @@ end
 ---@field reg string
 ---@field smods table
 
----Create a user command whose args are key=value tokens.
+---Create a user command. Args are `[sub] key=value...`.
 ---@param name string
 ---@param fn fun(opts: KvCommandOpts)
 ---@param spec KvSpec
@@ -429,6 +601,7 @@ function M.create(name, fn, spec)
     ---@type KvCommandOpts
     local wrap = {
       kv = parsed.kv,
+      sub = parsed.sub,
       parsed = parsed,
       args = opts.args,
       fargs = opts.fargs,
