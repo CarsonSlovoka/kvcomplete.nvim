@@ -20,6 +20,7 @@ kv.create("Build", function(opts)
   print(vim.inspect(opts))
 end, {
   keys = {
+    -- 子命令範例
     cmd = {
       kind = "enum",
       values = { "build", "test", "clean" },
@@ -38,6 +39,23 @@ end, {
     jobs = { kind = "number", hint = { "1", "4", "8" } },
     tag = { unique = false }, -- tag=a tag=b → kv.tag = { "a", "b" } -- 用unique使得可以放array
   },
+})
+
+
+local test_cmd_spec = kv.compile({
+  keys = {
+    foo = { "a", "b" },
+    path = "file"
+  }
+})
+-- 也能用原始的nvim指令，只套用補全就好
+vim.api.nvim_create_user_command("Testcmd", function(opts)
+  print(vim.inspect(opts.fargs))
+end, {
+  nargs = "*",
+  complete = function(a, c, p)
+    return kv.complete(test_cmd_spec, a, c, p)
+  end,
 })
 
 return {}
