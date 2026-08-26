@@ -80,6 +80,49 @@ end, {
 })
 
 
+kv.create("Tool2", function(opts)
+  print(vim.inspect(opts))
+  -- :Tool build android abi=arm
+  -- opts.sub        == "build"
+  -- opts.kv.target  == "android"
+  -- opts.kv.abi     == "arm"
+end, {
+  keys = {
+    jobs = { kind = "number", hint = { "1", "4", "8" } },
+  },
+  subs = {
+    -- 如果一個sub中還會有許多位置固定的參數, 可以用pos來加入
+    build = {
+      pri = 20,
+      pos = {
+        {
+          name = "target", -- 在kv中的變數名稱
+          values = { "android", "ios", "linux" },
+          -- required 預設 true
+        },
+      },
+      keys = {
+        abi = {
+          values_fn = function(ctx)
+            if ctx.kv.target == "android" then
+              return { "arm", "arm64", "x86" }
+            end
+            if ctx.kv.target == "ios" then
+              return { "arm64" }
+            end
+            return { "x64", "arm64" }
+          end,
+        },
+      },
+    },
+    test = {
+      pos = { { name = "file", kind = "file" } }, -- pos的範例2 輸出用kind的file, 所以tab會自動代入可用的檔案
+    },
+    clean = {},
+  },
+})
+
+
 local test_cmd_spec = kv.compile({
   keys = {
     foo = { "a", "b" },
