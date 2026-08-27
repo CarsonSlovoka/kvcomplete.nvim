@@ -131,7 +131,19 @@ local test_cmd_spec = kv.compile({
 })
 -- 也能用原始的nvim指令，只套用補全就好
 vim.api.nvim_create_user_command("Testcmd", function(opts)
-  print(vim.inspect(opts))
+  -- print(vim.inspect(opts))
+
+  local parsed = kv.parse(test_cmd_spec, opts.args)
+  -- :Testcmd foo=a path=%
+  -- parsed.kv.foo  == "a"
+  -- parsed.kv.path == "%"
+  -- parsed.sub     == nil     -- 沒宣告 subs. 有 subs 且第一個 token 命中時才有
+  -- parsed.errors  == { ... } -- strict 預設 true，有錯會列在這
+  if #parsed.errors > 0 then
+    vim.notify("Testcmd: " .. parsed.errors[1], vim.log.levels.ERROR)
+    return
+  end
+  vim.print(vim.inspect(parsed.kv))
 end, {
   nargs = "*",
   complete = function(a, c, p)
