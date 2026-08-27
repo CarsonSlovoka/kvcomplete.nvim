@@ -54,7 +54,7 @@ local MAX         = 50
 ---@field name string
 ---@field kind KvKind|nil
 ---@field values string[]|nil
----@field values_fn fun(ctx: KvCtx): string[]|nil
+---@field values_fn? fun(ctx: KvCtx): string[]|nil
 ---@field required boolean|nil   -- default true
 ---@field hint string[]|nil
 
